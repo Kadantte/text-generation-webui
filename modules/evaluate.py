@@ -2,20 +2,18 @@ import datetime
 from pathlib import Path
 
 import pandas as pd
-import torch
-from datasets import load_dataset
 from tqdm import tqdm
 
 from modules import shared
 from modules.logging_colors import logger
-from modules.models import clear_torch_cache, load_model, unload_model
+from modules.models import load_model, unload_model
 from modules.models_settings import get_model_metadata, update_model_parameters
 from modules.text_generation import encode
 
 
 def load_past_evaluations():
-    if Path('logs/evaluations.csv').exists():
-        df = pd.read_csv(Path('logs/evaluations.csv'), dtype=str)
+    if Path('user_data/logs/evaluations.csv').exists():
+        df = pd.read_csv(Path('user_data/logs/evaluations.csv'), dtype=str)
         df['Perplexity'] = pd.to_numeric(df['Perplexity'])
         return df
     else:
@@ -28,7 +26,7 @@ past_evaluations = load_past_evaluations()
 def save_past_evaluations(df):
     global past_evaluations
     past_evaluations = df
-    filepath = Path('logs/evaluations.csv')
+    filepath = Path('user_data/logs/evaluations.csv')
     filepath.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(filepath, index=False)
 
@@ -38,6 +36,11 @@ def calculate_perplexity(models, input_dataset, stride, _max_length):
     Based on:
     https://huggingface.co/docs/transformers/perplexity#calculating-ppl-with-fixedlength-models
     '''
+
+    import torch
+    from datasets import load_dataset
+
+    from modules.torch_utils import clear_torch_cache
 
     if shared.args.loader == "llama.cpp":
         logger.error("Perplexity evaluation is not implemented for the llama.cpp loader.")
@@ -66,7 +69,7 @@ def calculate_perplexity(models, input_dataset, stride, _max_length):
         data = load_dataset('ptb_text_only', 'penn_treebank', split='test')
         text = " ".join(data['sentence'])
     else:
-        with open(Path(f'training/datasets/{input_dataset}.txt'), 'r', encoding='utf-8') as f:
+        with open(Path(f'user_data/training/datasets/{input_dataset}.txt'), 'r', encoding='utf-8') as f:
             text = f.read()
 
     for model in models:
