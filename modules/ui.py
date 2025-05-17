@@ -2,9 +2,7 @@ import copy
 from pathlib import Path
 
 import gradio as gr
-import torch
 import yaml
-from transformers import is_torch_xpu_available
 
 import extensions
 from modules import shared
@@ -63,7 +61,7 @@ if not shared.args.old_colors:
         background_fill_primary_dark='var(--darker-gray)',
         body_background_fill="white",
         block_background_fill="transparent",
-        body_text_color="#333",
+        body_text_color='rgb(64, 64, 64)',
         button_secondary_background_fill="#f4f4f4",
         button_secondary_border_color="var(--border-color-primary)",
 
@@ -96,7 +94,7 @@ if not shared.args.old_colors:
         input_radius='0.375rem',
     )
 
-if Path("notification.mp3").exists():
+if Path("user_data/notification.mp3").exists():
     audio_notification_js = "document.querySelector('#audio_notification audio')?.play();"
 else:
     audio_notification_js = ""
@@ -107,15 +105,16 @@ def list_model_elements():
         'filter_by_loader',
         'loader',
         'cpu_memory',
-        'n_gpu_layers',
+        'gpu_layers',
         'threads',
         'threads_batch',
         'batch_size',
         'hqq_backend',
-        'n_ctx',
-        'max_seq_len',
+        'ctx_size',
         'cache_type',
         'tensor_split',
+        'extra_flags',
+        'streaming_llm',
         'gpu_split',
         'alpha_value',
         'rope_freq_base',
@@ -128,7 +127,6 @@ def list_model_elements():
         'torch_compile',
         'flash_attn',
         'use_flash_attention_2',
-        'auto_devices',
         'cpu',
         'disk',
         'row_split',
@@ -148,14 +146,12 @@ def list_model_elements():
         'cpp_runner',
         'trust_remote_code',
         'no_use_fast',
+        'model_draft',
+        'draft_max',
+        'gpu_layers_draft',
+        'device_draft',
+        'ctx_size_draft',
     ]
-
-    if is_torch_xpu_available():
-        for i in range(torch.xpu.device_count()):
-            elements.append(f'gpu_memory_{i}')
-    else:
-        for i in range(torch.cuda.device_count()):
-            elements.append(f'gpu_memory_{i}')
 
     return elements
 
@@ -196,13 +192,13 @@ def list_interface_input_elements():
         'max_new_tokens',
         'prompt_lookup_num_tokens',
         'max_tokens_second',
-        'max_updates_second',
         'do_sample',
         'dynamic_temperature',
         'temperature_last',
         'auto_max_new_tokens',
         'ban_eos_token',
         'add_bos_token',
+        'enable_thinking',
         'skip_special_tokens',
         'stream',
         'static_cache',
@@ -211,7 +207,6 @@ def list_interface_input_elements():
         'sampler_priority',
         'custom_stopping_strings',
         'custom_token_bans',
-        'show_after',
         'negative_prompt',
         'dry_sequence_breakers',
         'grammar_string',
@@ -272,7 +267,7 @@ def apply_interface_values(state, use_persistent=False):
         if 'textbox-default' in state and 'prompt_menu-default' in state:
             state.pop('prompt_menu-default')
 
-        if 'textbox-notebook' and 'prompt_menu-notebook' in state:
+        if 'textbox-notebook' in state and 'prompt_menu-notebook' in state:
             state.pop('prompt_menu-notebook')
 
     elements = list_interface_input_elements()

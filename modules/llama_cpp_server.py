@@ -1,10 +1,13 @@
 import json
+import os
 import pprint
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import llama_cpp_binaries
 import requests
@@ -63,7 +66,7 @@ class LlamaServer:
             "top_k": state["top_k"],
             "top_p": state["top_p"],
             "min_p": state["min_p"],
-            "tfs_z": state["tfs"],
+            "top_n_sigma": state["top_n_sigma"] if state["top_n_sigma"] > 0 else -1,
             "typical_p": state["typical_p"],
             "repeat_penalty": state["repetition_penalty"],
             "repeat_last_n": state["repetition_penalty_range"],
@@ -99,8 +102,10 @@ class LlamaServer:
 
             penalty_found = False
             for s in samplers:
-                if s.strip() in ["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]:
+                if s.strip() in ["dry", "top_k", "top_p", "top_n_sigma", "min_p", "temperature", "xtc"]:
                     filtered_samplers.append(s.strip())
+                elif s.strip() == "typical_p":
+                    filtered_samplers.append("typ_p")
                 elif not penalty_found and s.strip() == "repetition_penalty":
                     filtered_samplers.append("penalties")
                     penalty_found = True
@@ -132,6 +137,7 @@ class LlamaServer:
             "prompt": token_ids,
             "n_predict": max_new_tokens,
             "stream": True,
+            "cache_prompt": True
         })
 
         if shared.args.verbose:
@@ -140,8 +146,9 @@ class LlamaServer:
             pprint.PrettyPrinter(indent=4, sort_dicts=False).pprint(printable_payload)
             print()
 
-        # Make a direct request with streaming enabled using a context manager
-        with self.session.post(url, json=payload, stream=True) as response:
+        # Make the generation request
+        response = self.session.post(url, json=payload, stream=True)
+        try:
             response.raise_for_status()  # Raise an exception for HTTP errors
 
             full_text = ""
@@ -178,6 +185,8 @@ class LlamaServer:
                     print(f"JSON decode error: {e}")
                     print(f"Problematic line: {line}")
                     continue
+        finally:
+            response.close()
 
     def generate(self, prompt, state):
         output = ""
@@ -206,14 +215,15 @@ class LlamaServer:
             pprint.PrettyPrinter(indent=4, sort_dicts=False).pprint(printable_payload)
             print()
 
-        response = self.session.post(url, json=payload)
-        result = response.json()
+        for retry in range(5):
+            response = self.session.post(url, json=payload)
+            result = response.json()
 
-        if "completion_probabilities" in result:
-            if use_samplers:
-                return result["completion_probabilities"][0]["top_probs"]
-            else:
-                return result["completion_probabilities"][0]["top_logprobs"]
+            if "completion_probabilities" in result:
+                if use_samplers:
+                    return result["completion_probabilities"][0]["top_probs"]
+                else:
+                    return result["completion_probabilities"][0]["top_logprobs"]
         else:
             raise Exception(f"Unexpected response format: 'completion_probabilities' not found in {result}")
 
@@ -250,10 +260,11 @@ class LlamaServer:
         cmd = [
             self.server_path,
             "--model", self.model_path,
-            "--ctx-size", str(shared.args.n_ctx),
-            "--n-gpu-layers", str(shared.args.n_gpu_layers),
+            "--ctx-size", str(shared.args.ctx_size),
+            "--gpu-layers", str(shared.args.gpu_layers),
             "--batch-size", str(shared.args.batch_size),
             "--port", str(self.port),
+            "--no-webui",
         ]
 
         if shared.args.flash_attn:
@@ -274,38 +285,84 @@ class LlamaServer:
             cmd.append("--no-kv-offload")
         if shared.args.row_split:
             cmd += ["--split-mode", "row"]
+        cache_type = "fp16"
         if shared.args.cache_type != "fp16" and shared.args.cache_type in llamacpp_valid_cache_types:
             cmd += ["--cache-type-k", shared.args.cache_type, "--cache-type-v", shared.args.cache_type]
+            cache_type = shared.args.cache_type
         if shared.args.compress_pos_emb != 1:
             cmd += ["--rope-freq-scale", str(1.0 / shared.args.compress_pos_emb)]
         if shared.args.rope_freq_base > 0:
             cmd += ["--rope-freq-base", str(shared.args.rope_freq_base)]
+        if shared.args.model_draft not in [None, 'None']:
+            path = Path(shared.args.model_draft)
+            if not path.exists():
+                path = Path(f'{shared.args.model_dir}/{shared.args.model_draft}')
 
+            if path.is_file():
+                model_file = path
+            else:
+                model_file = sorted(Path(f'{shared.args.model_dir}/{shared.args.model_draft}').glob('*.gguf'))[0]
+
+            cmd += ["--model-draft", model_file]
+            if shared.args.draft_max > 0:
+                cmd += ["--draft-max", str(shared.args.draft_max)]
+            if shared.args.gpu_layers_draft > 0:
+                cmd += ["--gpu-layers-draft", str(shared.args.gpu_layers_draft)]
+            if shared.args.device_draft:
+                cmd += ["--device-draft", shared.args.device_draft]
+            if shared.args.ctx_size_draft > 0:
+                cmd += ["--ctx-size-draft", str(shared.args.ctx_size_draft)]
+        if shared.args.streaming_llm:
+            cmd += ["--cache-reuse", "1"]
+        if shared.args.extra_flags:
+            # Clean up the input
+            extra_flags = shared.args.extra_flags.strip()
+            if extra_flags.startswith('"') and extra_flags.endswith('"'):
+                extra_flags = extra_flags[1:-1].strip()
+            elif extra_flags.startswith("'") and extra_flags.endswith("'"):
+                extra_flags = extra_flags[1:-1].strip()
+
+            for flag_item in extra_flags.split(','):
+                if '=' in flag_item:
+                    flag, value = flag_item.split('=', 1)
+                    if len(flag) <= 3:
+                        cmd += [f"-{flag}", value]
+                    else:
+                        cmd += [f"--{flag}", value]
+                else:
+                    if len(flag_item) <= 3:
+                        cmd.append(f"-{flag_item}")
+                    else:
+                        cmd.append(f"--{flag_item}")
+
+        env = os.environ.copy()
+        if os.name == 'posix':
+            current_path = env.get('LD_LIBRARY_PATH', '')
+            if current_path:
+                env['LD_LIBRARY_PATH'] = f"{current_path}:{os.path.dirname(self.server_path)}"
+            else:
+                env['LD_LIBRARY_PATH'] = os.path.dirname(self.server_path)
+
+        if shared.args.verbose:
+            logger.info("llama-server command-line flags:")
+            print(' '.join(str(item) for item in cmd[1:]))
+            print()
+
+        logger.info(f"Using gpu_layers={shared.args.gpu_layers} | ctx_size={shared.args.ctx_size} | cache_type={cache_type}")
         # Start the server with pipes for output
         self.process = subprocess.Popen(
             cmd,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1
+            bufsize=1,
+            env=env
         )
 
-        def filter_stderr(process_stderr):
-            try:
-                for line in iter(process_stderr.readline, ''):
-                    if not line.startswith(('srv ', 'slot ')) and 'log_server_r: request: GET /health' not in line:
-                        sys.stderr.write(line)
-                        sys.stderr.flush()
-            except (ValueError, IOError):
-                # Handle pipe closed exceptions
-                pass
-
-        threading.Thread(target=filter_stderr, args=(self.process.stderr,), daemon=True).start()
+        threading.Thread(target=filter_stderr_with_progress, args=(self.process.stderr,), daemon=True).start()
 
         # Wait for server to be healthy
         health_url = f"http://127.0.0.1:{self.port}/health"
-        start_time = time.time()
-        timeout = 3600 * 8  # 8 hours
-        while time.time() - start_time < timeout:
+        while True:
             # Check if process is still alive
             if self.process.poll() is not None:
                 # Process has terminated
@@ -320,8 +377,6 @@ class LlamaServer:
                 pass
 
             time.sleep(1)
-        else:
-            raise TimeoutError(f"Server health check timed out after {timeout} seconds")
 
         # Server is now healthy, get model info
         self._get_vocabulary_size()
@@ -350,3 +405,18 @@ class LlamaServer:
                 self.process.kill()
 
             self.process = None
+
+
+def filter_stderr_with_progress(process_stderr):
+    progress_pattern = re.compile(r'slot update_slots: id.*progress = (\d+\.\d+)')
+    try:
+        for line in iter(process_stderr.readline, ''):
+            progress_match = progress_pattern.search(line)
+            if progress_match:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            elif not line.startswith(('srv ', 'slot ')) and 'log_server_r: request: GET /health' not in line:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+    except (ValueError, IOError):
+        pass

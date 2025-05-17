@@ -2,12 +2,12 @@ import time
 import traceback
 
 import numpy as np
-import torch
 
-from modules import models, sampler_hijack, shared
+from modules import models, shared
 from modules.logging_colors import logger
-from modules.models import get_device, load_model
+from modules.models import load_model
 from modules.text_generation import generate_reply
+from modules.utils import check_model_loaded
 
 global_scores = None
 
@@ -34,32 +34,44 @@ def get_next_logits(*args, **kwargs):
 
 
 def _get_next_logits(prompt, state, use_samplers, previous, top_logits=25, return_dict=False):
-    if shared.model is None:
-        logger.error("No model is loaded! Select one in the Model tab.")
-        return 'Error: No model is loaded1 Select one in the Model tab.', previous
+    model_is_loaded, error_message = check_model_loaded()
+    if not model_is_loaded:
+        return error_message, previous
 
-    is_non_hf_exllamav2 = shared.model.__class__.__name__ == 'Exllamav2Model'
-    is_llamacpp = shared.model.__class__.__name__ == 'LlamaServer'
-
-    if is_llamacpp:
+    # llama.cpp case
+    if shared.model.__class__.__name__ == 'LlamaServer':
         logprobs = shared.model.get_logits(prompt, state, n_probs=top_logits, use_samplers=use_samplers)
+
         if return_dict:
             output = {}
             for entry in logprobs:
                 token = repr(entry['token'])
+                if len(token) > 2 and token.startswith("'") and token.endswith("'"):
+                    token = token[1:-1]
+
                 prob = entry['prob'] if use_samplers else np.exp(entry['logprob'])
                 output[token] = prob
-
             return output
         else:
             output = ''
             for entry in logprobs:
                 token = repr(entry['token'])
+                if len(token) > 2 and token.startswith("'") and token.endswith("'"):
+                    token = token[1:-1]
+
                 prob = entry['prob'] if use_samplers else np.exp(entry['logprob'])
                 output += f"{prob:.5f}  -  {token}\n"
-
             return output, previous
+
+    # All other model types
     else:
+        import torch
+
+        from modules import sampler_hijack
+        from modules.torch_utils import get_device
+
+        is_non_hf_exllamav2 = shared.model.__class__.__name__ == 'Exllamav2Model'
+
         if not use_samplers:
             state = {'stream': True}
 
